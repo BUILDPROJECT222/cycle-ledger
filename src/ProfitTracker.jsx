@@ -1,13 +1,18 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import {
   Plus, Trash2, ChevronDown, ChevronRight, TrendingUp, TrendingDown,
-  Coins, Pickaxe, X, Download, Upload, ShoppingCart, AlertCircle, CheckCircle2,
+  Coins, Pickaxe, X, Download, Upload, ShoppingCart, AlertCircle,
+  CheckCircle2, RefreshCw, Wallet,
 } from "lucide-react";
 
 /* ---------- formatting ---------- */
 const fmtIDR = (n) => "Rp" + Math.round(n || 0).toLocaleString("id-ID");
 const fmtPct = (n) =>
   (n * 100).toLocaleString("id-ID", { maximumFractionDigits: 1 }) + "%";
+const fmtKins = (n) =>
+  n == null ? "—" : n.toLocaleString("id-ID", { maximumFractionDigits: 2 });
+const fmtUSD = (n) =>
+  n == null ? "—" : "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
 
 const CUR = { IDR: "IDR", USD: "USD" };
 
@@ -21,139 +26,205 @@ const newCycle = (n, rate) => ({
 });
 
 const STORAGE_KEY = "cycle_ledger_v1";
-const RATE_KEY = "cycle_ledger_rate_v1";
+const RATE_KEY    = "cycle_ledger_rate_v1";
+const WALLET_KEY  = "wallets_v1";
+const MINT_KEY    = "kins_mint_v1";
 
-/* localStorage helpers */
 const load = (k, fallback) => {
-  try {
-    const v = localStorage.getItem(k);
-    return v ? JSON.parse(v) : fallback;
-  } catch {
-    return fallback;
-  }
+  try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fallback; }
+  catch { return fallback; }
 };
-const save = (k, v) => {
-  try {
-    localStorage.setItem(k, JSON.stringify(v));
-  } catch {}
-};
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
 function seedData() {
   const c = newCycle(1, 17800);
   c.expenses = [
     { id: crypto.randomUUID(), label: "Modal Rupiah", amount: 440000, currency: CUR.IDR },
-    { id: crypto.randomUUID(), label: "Modal Dollar", amount: 32, currency: CUR.USD },
+    { id: crypto.randomUUID(), label: "Modal Dollar", amount: 32,     currency: CUR.USD },
   ];
-  c.goldQty = 40;
-  c.goldPrice = 3.5;
+  c.goldQty = 40; c.goldPrice = 3.5;
   return [c];
 }
 
-/* ---------- Kintara parser ---------- */
-function parseKintara(text) {
-  const pattern = /You bought (\d+) (.+?) for \$([\d.]+) USD/g;
-  const results = [];
-  let match;
-  while ((match = pattern.exec(text)) !== null) {
-    const qty = parseInt(match[1], 10);
-    const item = match[2].trim();
-    const price = parseFloat(match[3]);
-    const label = qty > 1 ? `${qty}x ${item}` : item;
-    results.push({ id: crypto.randomUUID(), label, amount: price, currency: CUR.USD });
-  }
-  return results;
+function newWallet(n) {
+  return { id: crypto.randomUUID(), name: `Akun ${n}`, address: "", kinsBalance: null, loading: false, error: null };
 }
 
+/* ---------- Kintara chat parser ---------- */
+function parseKintara(text) {
+  const re = /You bought (\d+) (.+?) for \$([\d.]+) USD/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const qty = parseInt(m[1], 10);
+    const label = qty > 1 ? `${qty}x ${m[2].trim()}` : m[2].trim();
+    out.push({ id: crypto.randomUUID(), label, amount: parseFloat(m[3]), currency: CUR.USD });
+  }
+  return out;
+}
+
+/* ---------- External fetchers (pure, no state) ---------- */
+async function fetchKinsPrice(mint) {
+  if (!mint?.trim()) return null;
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint.trim()}`);
+    const d = await r.json();
+    const pair = d.pairs?.[0];
+    return pair?.priceUsd ? parseFloat(pair.priceUsd) : null;
+  } catch { return null; }
+}
+
+async function fetchKinsBalance(walletAddr, mintAddr) {
+  if (!walletAddr?.trim() || !mintAddr?.trim()) return null;
+  try {
+    const r = await fetch("https://api.mainnet-beta.solana.com", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1,
+        method: "getTokenAccountsByOwner",
+        params: [walletAddr.trim(), { mint: mintAddr.trim() }, { encoding: "jsonParsed" }],
+      }),
+    });
+    const d = await r.json();
+    if (d.error) return null;
+    const accounts = d.result?.value || [];
+    return accounts.reduce((s, a) => s + (a.account.data.parsed.info.tokenAmount.uiAmount || 0), 0);
+  } catch { return null; }
+}
+
+/* ============================================================
+   Main Component
+   ============================================================ */
 export default function ProfitTracker() {
   const [defaultRate, setDefaultRate] = useState(() => load(RATE_KEY, 17800));
-  const [cycles, setCycles] = useState(() => load(STORAGE_KEY, null) || seedData());
-  const [open, setOpen] = useState(() => {
+  const [cycles, setCycles]           = useState(() => load(STORAGE_KEY, null) || seedData());
+  const [open, setOpen]               = useState(() => {
     const c = load(STORAGE_KEY, null) || seedData();
     return Object.fromEntries(c.map((x, i) => [x.id, i === c.length - 1]));
   });
 
-  /* import kintara modal state */
-  const [kintaraModal, setKintaraModal] = useState(null); // { cycleId }
-  const [kintaraPaste, setKintaraPaste] = useState("");
+  /* --- wallet state --- */
+  const [wallets, setWallets] = useState(() =>
+    load(WALLET_KEY, null) || [1, 2, 3, 4].map(newWallet)
+  );
+  const [kinsMint, setKinsMint]         = useState(() => load(MINT_KEY, ""));
+  const [mintDraft, setMintDraft]       = useState(() => load(MINT_KEY, ""));
+  const [kinsPrice, setKinsPrice]       = useState(null);
+  const [kinsPriceTs, setKinsPriceTs]   = useState(null);
+  const [priceLoading, setPriceLoading] = useState(false);
+  const [walletsOpen, setWalletsOpen]   = useState(true);
+
+  /* kintara import modal */
+  const [kintaraModal,   setKintaraModal]   = useState(null);
+  const [kintaraPaste,   setKintaraPaste]   = useState("");
   const [kintaraPreview, setKintaraPreview] = useState([]);
-  const [kintaraStatus, setKintaraStatus] = useState(null); // "ok" | "empty"
+  const [kintaraStatus,  setKintaraStatus]  = useState(null);
 
-  useEffect(() => save(STORAGE_KEY, cycles), [cycles]);
-  useEffect(() => save(RATE_KEY, defaultRate), [defaultRate]);
+  /* persist */
+  useEffect(() => save(STORAGE_KEY, cycles),                               [cycles]);
+  useEffect(() => save(RATE_KEY,    defaultRate),                          [defaultRate]);
+  useEffect(() => save(WALLET_KEY,  wallets.map(w => ({ ...w, loading: false, error: null }))), [wallets]);
+  useEffect(() => save(MINT_KEY,    kinsMint),                             [kinsMint]);
 
+  /* ---------- price auto-refresh ---------- */
+  const priceIntervalRef = useRef(null);
+
+  const doFetchPrice = async (mint) => {
+    if (!mint?.trim()) return;
+    setPriceLoading(true);
+    const p = await fetchKinsPrice(mint);
+    if (p !== null) { setKinsPrice(p); setKinsPriceTs(Date.now()); }
+    setPriceLoading(false);
+  };
+
+  useEffect(() => {
+    if (priceIntervalRef.current) clearInterval(priceIntervalRef.current);
+    if (!kinsMint.trim()) return;
+    doFetchPrice(kinsMint);
+    priceIntervalRef.current = setInterval(() => doFetchPrice(kinsMint), 30000);
+    return () => clearInterval(priceIntervalRef.current);
+  }, [kinsMint]);
+
+  /* ---------- wallet balance helpers ---------- */
+  const refreshWallet = async (walletId) => {
+    const w = wallets.find(x => x.id === walletId);
+    if (!w?.address.trim() || !kinsMint.trim()) return;
+    setWallets(p => p.map(x => x.id === walletId ? { ...x, loading: true, error: null } : x));
+    const bal = await fetchKinsBalance(w.address, kinsMint);
+    setWallets(p => p.map(x =>
+      x.id === walletId
+        ? { ...x, kinsBalance: bal, loading: false, error: bal === null ? "Gagal / alamat tidak valid" : null }
+        : x
+    ));
+  };
+
+  const refreshAllWallets = () => wallets.forEach(w => w.address.trim() && refreshWallet(w.id));
+
+  const applyMint = () => {
+    const m = mintDraft.trim();
+    setKinsMint(m);
+  };
+
+  /* ---------- wallet field patch ---------- */
+  const patchWallet = (id, patch) => setWallets(p => p.map(w => w.id === id ? { ...w, ...patch } : w));
+
+  /* ---------- cycle derived ---------- */
   const calc = (cy) => {
     const rate = Number(cy.rate) || 0;
-    const modalIDR = cy.expenses.reduce(
-      (s, e) => s + (e.currency === CUR.USD ? Number(e.amount || 0) * rate : Number(e.amount || 0)),
-      0
+    const modalIDR  = cy.expenses.reduce(
+      (s, e) => s + (e.currency === CUR.USD ? Number(e.amount || 0) * rate : Number(e.amount || 0)), 0
     );
     const revenueIDR = Number(cy.goldQty || 0) * Number(cy.goldPrice || 0) * rate;
-    const profitIDR = revenueIDR - modalIDR;
-    const roi = modalIDR > 0 ? profitIDR / modalIDR : 0;
-    return { modalIDR, revenueIDR, profitIDR, roi };
+    const profitIDR  = revenueIDR - modalIDR;
+    return { modalIDR, revenueIDR, profitIDR, roi: modalIDR > 0 ? profitIDR / modalIDR : 0 };
   };
 
   const totals = useMemo(() => {
     let modal = 0, rev = 0, profit = 0;
-    cycles.forEach((cy) => {
-      const c = calc(cy);
-      modal += c.modalIDR; rev += c.revenueIDR; profit += c.profitIDR;
-    });
+    cycles.forEach(cy => { const c = calc(cy); modal += c.modalIDR; rev += c.revenueIDR; profit += c.profitIDR; });
     return { modal, rev, profit, roi: modal > 0 ? profit / modal : 0 };
   }, [cycles]);
 
   const bestWorst = useMemo(() => {
     if (!cycles.length) return null;
     let best = null, worst = null;
-    cycles.forEach((cy) => {
+    cycles.forEach(cy => {
       const p = calc(cy).profitIDR;
-      if (best === null || p > best.p) best = { name: cy.name, p };
+      if (best  === null || p > best.p)  best  = { name: cy.name, p };
       if (worst === null || p < worst.p) worst = { name: cy.name, p };
     });
     return { best, worst };
   }, [cycles]);
 
-  /* mutations */
+  /* ---------- cycle mutations ---------- */
   const addCycle = () => {
     const c = newCycle(cycles.length + 1, defaultRate);
-    setCycles((p) => [...p, c]);
-    setOpen((p) => ({ ...p, [c.id]: true }));
+    setCycles(p => [...p, c]);
+    setOpen(p => ({ ...p, [c.id]: true }));
   };
-  const removeCycle = (id) => setCycles((p) => p.filter((c) => c.id !== id));
-  const patchCycle = (id, patch) =>
-    setCycles((p) => p.map((c) => (c.id === id ? { ...c, ...patch } : c)));
-  const addExpense = (id) =>
-    setCycles((p) =>
-      p.map((c) =>
-        c.id === id
-          ? { ...c, expenses: [...c.expenses, { id: crypto.randomUUID(), label: "", amount: "", currency: CUR.IDR }] }
-          : c
-      )
-    );
-  const patchExpense = (cid, eid, patch) =>
-    setCycles((p) =>
-      p.map((c) =>
-        c.id === cid ? { ...c, expenses: c.expenses.map((e) => (e.id === eid ? { ...e, ...patch } : e)) } : c
-      )
-    );
-  const removeExpense = (cid, eid) =>
-    setCycles((p) =>
-      p.map((c) => (c.id === cid ? { ...c, expenses: c.expenses.filter((e) => e.id !== eid) } : c))
-    );
+  const removeCycle   = (id)         => setCycles(p => p.filter(c => c.id !== id));
+  const patchCycle    = (id, patch)  => setCycles(p => p.map(c => c.id === id ? { ...c, ...patch } : c));
+  const addExpense    = (id)         => setCycles(p => p.map(c =>
+    c.id === id ? { ...c, expenses: [...c.expenses, { id: crypto.randomUUID(), label: "", amount: "", currency: CUR.IDR }] } : c
+  ));
+  const patchExpense  = (cid, eid, patch) => setCycles(p => p.map(c =>
+    c.id === cid ? { ...c, expenses: c.expenses.map(e => e.id === eid ? { ...e, ...patch } : e) } : c
+  ));
+  const removeExpense = (cid, eid)   => setCycles(p => p.map(c =>
+    c.id === cid ? { ...c, expenses: c.expenses.filter(e => e.id !== eid) } : c
+  ));
 
   /* export / import */
   const exportData = () => {
     const blob = new Blob([JSON.stringify({ defaultRate, cycles }, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "cycle-ledger-backup.json";
-    a.click();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = "cycle-ledger-backup.json"; a.click();
     URL.revokeObjectURL(url);
   };
   const importData = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const file = e.target.files?.[0]; if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
       try {
@@ -161,29 +232,17 @@ export default function ProfitTracker() {
         if (Array.isArray(data.cycles)) {
           setCycles(data.cycles);
           if (data.defaultRate) setDefaultRate(data.defaultRate);
-          setOpen(Object.fromEntries(data.cycles.map((x) => [x.id, false])));
+          setOpen(Object.fromEntries(data.cycles.map(x => [x.id, false])));
         }
-      } catch {
-        alert("File backup tidak valid.");
-      }
+      } catch { alert("File backup tidak valid."); }
     };
     reader.readAsText(file);
     e.target.value = "";
   };
 
-  /* kintara modal handlers */
-  const openKintara = (cycleId) => {
-    setKintaraModal({ cycleId });
-    setKintaraPaste("");
-    setKintaraPreview([]);
-    setKintaraStatus(null);
-  };
-  const closeKintara = () => {
-    setKintaraModal(null);
-    setKintaraPaste("");
-    setKintaraPreview([]);
-    setKintaraStatus(null);
-  };
+  /* kintara modal */
+  const openKintara  = (cycleId) => { setKintaraModal({ cycleId }); setKintaraPaste(""); setKintaraPreview([]); setKintaraStatus(null); };
+  const closeKintara = ()        => { setKintaraModal(null); setKintaraPaste(""); setKintaraPreview([]); setKintaraStatus(null); };
   const handleKintaraPaste = (text) => {
     setKintaraPaste(text);
     const parsed = parseKintara(text);
@@ -192,23 +251,26 @@ export default function ProfitTracker() {
   };
   const confirmKintara = () => {
     if (!kintaraPreview.length || !kintaraModal) return;
-    const { cycleId } = kintaraModal;
-    setCycles((p) =>
-      p.map((c) =>
-        c.id === cycleId
-          ? { ...c, expenses: [...c.expenses, ...kintaraPreview] }
-          : c
-      )
-    );
+    setCycles(p => p.map(c => c.id === kintaraModal.cycleId ? { ...c, expenses: [...c.expenses, ...kintaraPreview] } : c));
     closeKintara();
   };
 
+  /* ---------- wallet totals ---------- */
+  const totalKins    = wallets.reduce((s, w) => s + (w.kinsBalance || 0), 0);
+  const totalKinsUSD = kinsPrice != null ? totalKins * kinsPrice : null;
   const kintaraTotalUSD = kintaraPreview.reduce((s, e) => s + Number(e.amount), 0);
 
+  const priceAgo = kinsPriceTs
+    ? Math.round((Date.now() - kinsPriceTs) / 1000) + "d lalu"
+    : null;
+
+  /* ==================== RENDER ==================== */
   return (
     <div style={S.page}>
       <div style={S.glow} />
       <div style={S.wrap}>
+
+        {/* ---- Header ---- */}
         <header style={S.header}>
           <div style={S.brand}>
             <div style={S.logo}><Pickaxe size={20} strokeWidth={2.2} /></div>
@@ -218,10 +280,8 @@ export default function ProfitTracker() {
             </div>
           </div>
           <div style={S.toolbar}>
-            <button style={S.ghostBtn} onClick={exportData} title="Unduh backup data">
-              <Download size={15} /> Backup
-            </button>
-            <label style={S.ghostBtn} title="Muat dari backup">
+            <button style={S.ghostBtn} onClick={exportData}><Download size={15} /> Backup</button>
+            <label style={S.ghostBtn}>
               <Upload size={15} /> Muat
               <input type="file" accept="application/json" onChange={importData} style={{ display: "none" }} />
             </label>
@@ -229,55 +289,151 @@ export default function ProfitTracker() {
               <span style={S.rateLabel}>USD→IDR</span>
               <div style={S.rateInputWrap}>
                 <span style={S.rsign}>Rp</span>
-                <input
-                  style={S.rateInput}
-                  type="number"
-                  value={defaultRate}
-                  onChange={(e) => setDefaultRate(Number(e.target.value))}
-                />
+                <input style={S.rateInput} type="number" value={defaultRate}
+                  onChange={e => setDefaultRate(Number(e.target.value))} />
               </div>
             </div>
           </div>
         </header>
 
-        {/* summary */}
-        <section className="summary-grid" style={S.summary}>
-          <SummaryCell label="Total Modal" value={fmtIDR(totals.modal)} />
+        {/* ---- Summary ---- */}
+        <section style={S.summary}>
+          <SummaryCell label="Total Modal"   value={fmtIDR(totals.modal)} />
           <SummaryCell label="Total Revenue" value={fmtIDR(totals.rev)} />
-          <SummaryCell label="Net Profit" value={fmtIDR(totals.profit)} big tone={totals.profit >= 0 ? "good" : "bad"} />
-          <SummaryCell label="ROI Total" value={fmtPct(totals.roi)} tone={totals.roi >= 0 ? "good" : "bad"} />
+          <SummaryCell label="Net Profit"    value={fmtIDR(totals.profit)} big tone={totals.profit >= 0 ? "good" : "bad"} />
+          <SummaryCell label="ROI Total"     value={fmtPct(totals.roi)}   tone={totals.roi   >= 0 ? "good" : "bad"} />
         </section>
 
         {bestWorst && cycles.length > 1 && (
           <div style={S.insights}>
-            <span style={S.insight}>
-              <TrendingUp size={13} style={{ color: "#4ec27e" }} /> Terbaik:{" "}
-              <b style={{ color: "#cfd6df" }}>{bestWorst.best.name}</b> ({fmtIDR(bestWorst.best.p)})
-            </span>
+            <span style={S.insight}><TrendingUp size={13} style={{ color: "#4ec27e" }} /> Terbaik: <b style={{ color: "#cfd6df" }}>{bestWorst.best.name}</b> ({fmtIDR(bestWorst.best.p)})</span>
             <span style={S.insightDivider} />
-            <span style={S.insight}>
-              <TrendingDown size={13} style={{ color: "#e0686b" }} /> Terendah:{" "}
-              <b style={{ color: "#cfd6df" }}>{bestWorst.worst.name}</b> ({fmtIDR(bestWorst.worst.p)})
-            </span>
+            <span style={S.insight}><TrendingDown size={13} style={{ color: "#e0686b" }} /> Terendah: <b style={{ color: "#cfd6df" }}>{bestWorst.worst.name}</b> ({fmtIDR(bestWorst.worst.p)})</span>
           </div>
         )}
 
-        {/* cycles */}
+        {/* ======== SOLANA WALLET PANEL ======== */}
+        <div style={S.walletPanel}>
+          {/* Panel Header */}
+          <div style={S.walletHead} onClick={() => setWalletsOpen(p => !p)}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Wallet size={16} color="#a78bfa" />
+              <span style={S.walletTitle}>SOLANA WALLETS</span>
+              {kinsPrice != null && (
+                <div style={S.priceBadge}>
+                  <span style={S.priceDot} />
+                  KINS {fmtUSD(kinsPrice)}
+                  {priceAgo && <span style={S.priceAgo}> · {priceAgo}</span>}
+                </div>
+              )}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button style={S.refreshAllBtn}
+                onClick={e => { e.stopPropagation(); doFetchPrice(kinsMint); refreshAllWallets(); }}
+                title="Refresh semua">
+                <RefreshCw size={13} style={priceLoading ? { animation: "spin 1s linear infinite" } : {}} />
+                Refresh
+              </button>
+              <span style={S.chev}>{walletsOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</span>
+            </div>
+          </div>
+
+          {walletsOpen && (
+            <div style={S.walletBody}>
+
+              {/* Mint address config */}
+              <div style={S.mintRow}>
+                <span style={S.mintLabel}>Token Mint KINS</span>
+                <div style={S.mintInputGroup}>
+                  <input
+                    style={S.mintInput}
+                    placeholder="Paste token mint address dari Solscan/DexScreener…"
+                    value={mintDraft}
+                    onChange={e => setMintDraft(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && applyMint()}
+                    spellCheck={false}
+                  />
+                  <button style={S.mintApplyBtn} onClick={applyMint}>Set</button>
+                </div>
+                {!kinsMint && (
+                  <span style={S.mintHint}>
+                    Temukan mint address di <b>Solscan.io</b> → cari token KINS → copy "Token Address"
+                  </span>
+                )}
+              </div>
+
+              {/* Wallet rows */}
+              <div style={S.walletList}>
+                {wallets.map((w) => {
+                  const usdVal = kinsPrice != null && w.kinsBalance != null ? w.kinsBalance * kinsPrice : null;
+                  return (
+                    <div key={w.id} style={S.walletRow}>
+                      <div style={S.walletRowTop}>
+                        <input
+                          style={S.walletName}
+                          value={w.name}
+                          onChange={e => patchWallet(w.id, { name: e.target.value })}
+                          placeholder="Nama akun"
+                        />
+                        <input
+                          style={S.walletAddr}
+                          value={w.address}
+                          onChange={e => patchWallet(w.id, { address: e.target.value })}
+                          onBlur={() => w.address.trim().length > 30 && kinsMint && refreshWallet(w.id)}
+                          placeholder="Alamat wallet Solana (pubkey)…"
+                          spellCheck={false}
+                        />
+                        <button
+                          style={S.walletRefreshBtn}
+                          onClick={() => refreshWallet(w.id)}
+                          disabled={!w.address.trim() || !kinsMint}
+                          title="Refresh balance"
+                        >
+                          <RefreshCw size={13} style={w.loading ? { animation: "spin 1s linear infinite" } : {}} />
+                        </button>
+                      </div>
+                      <div style={S.walletRowBot}>
+                        {w.error ? (
+                          <span style={{ color: "#e87a7d", fontSize: 11.5, fontFamily: mono }}>{w.error}</span>
+                        ) : (
+                          <>
+                            <span style={S.walletBalLabel}>KINS</span>
+                            <span style={S.walletBal}>{w.loading ? "…" : fmtKins(w.kinsBalance)}</span>
+                            {usdVal != null && !w.loading && (
+                              <span style={S.walletUSD}>≈ {fmtUSD(usdVal)}</span>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Total row */}
+              <div style={S.walletTotal}>
+                <span style={S.walletTotalLabel}>TOTAL KINS</span>
+                <span style={S.walletTotalKins}>{fmtKins(totalKins)}</span>
+                <span style={S.walletTotalSep}>·</span>
+                <span style={S.walletTotalUSD}>{totalKinsUSD != null ? fmtUSD(totalKinsUSD) : "—"}</span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ---- Cycles ---- */}
         <div style={S.cycleList}>
           {cycles.map((cy) => {
-            const c = calc(cy);
+            const c    = calc(cy);
             const isOpen = open[cy.id];
-            const pos = c.profitIDR >= 0;
+            const pos  = c.profitIDR >= 0;
             return (
               <article key={cy.id} style={{ ...S.card, borderLeft: `3px solid ${pos ? "#3f7d56" : "#8a3b3d"}` }}>
-                <div style={S.cardHead} onClick={() => setOpen((p) => ({ ...p, [cy.id]: !p[cy.id] }))}>
+                <div style={S.cardHead} onClick={() => setOpen(p => ({ ...p, [cy.id]: !p[cy.id] }))}>
                   <span style={S.chev}>{isOpen ? <ChevronDown size={18} /> : <ChevronRight size={18} />}</span>
-                  <input
-                    style={S.cycleName}
-                    value={cy.name}
-                    onClick={(e) => e.stopPropagation()}
-                    onChange={(e) => patchCycle(cy.id, { name: e.target.value })}
-                  />
+                  <input style={S.cycleName} value={cy.name}
+                    onClick={e => e.stopPropagation()}
+                    onChange={e => patchCycle(cy.id, { name: e.target.value })} />
                   <div style={S.headStats}>
                     <span style={S.headStat}>modal {fmtIDR(c.modalIDR)}</span>
                     <span style={{ ...S.headProfit, color: pos ? "#5ccb85" : "#e87a7d" }}>
@@ -285,11 +441,7 @@ export default function ProfitTracker() {
                       {fmtIDR(c.profitIDR)}
                     </span>
                   </div>
-                  <button
-                    style={S.delCycle}
-                    onClick={(e) => { e.stopPropagation(); removeCycle(cy.id); }}
-                    aria-label="hapus cycle"
-                  >
+                  <button style={S.delCycle} onClick={e => { e.stopPropagation(); removeCycle(cy.id); }} aria-label="hapus cycle">
                     <X size={16} />
                   </button>
                 </div>
@@ -300,12 +452,8 @@ export default function ProfitTracker() {
                       <span style={S.bodyLabel}>Kurs cycle ini</span>
                       <div style={S.inlineRate}>
                         <span style={S.rsignSm}>Rp</span>
-                        <input
-                          style={S.rateInputSm}
-                          type="number"
-                          value={cy.rate}
-                          onChange={(e) => patchCycle(cy.id, { rate: Number(e.target.value) })}
-                        />
+                        <input style={S.rateInputSm} type="number" value={cy.rate}
+                          onChange={e => patchCycle(cy.id, { rate: Number(e.target.value) })} />
                       </div>
                     </div>
 
@@ -314,11 +462,7 @@ export default function ProfitTracker() {
                       <div style={S.sectionTitle}>
                         <span>PENGELUARAN</span>
                         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                          <button
-                            style={S.kintaraBtn}
-                            onClick={(e) => { e.stopPropagation(); openKintara(cy.id); }}
-                            title="Import pembelian dari Kintara.gg"
-                          >
+                          <button style={S.kintaraBtn} onClick={e => { e.stopPropagation(); openKintara(cy.id); }}>
                             <ShoppingCart size={12} /> Import Kintara
                           </button>
                           <span style={S.sectionSum}>{fmtIDR(c.modalIDR)}</span>
@@ -332,35 +476,19 @@ export default function ProfitTracker() {
                           <span style={{ width: 28 }} />
                         </div>
                       )}
-                      {cy.expenses.length === 0 && (
-                        <div style={S.empty}>Belum ada pengeluaran tercatat.</div>
-                      )}
-                      {cy.expenses.map((e) => (
+                      {cy.expenses.length === 0 && <div style={S.empty}>Belum ada pengeluaran tercatat.</div>}
+                      {cy.expenses.map(e => (
                         <div key={e.id} style={S.expRow}>
-                          <input
-                            style={S.expLabel}
-                            placeholder="mis. beli wood, coal, metal…"
-                            value={e.label}
-                            onChange={(ev) => patchExpense(cy.id, e.id, { label: ev.target.value })}
-                          />
-                          <input
-                            style={S.expAmt}
-                            type="number"
-                            placeholder="0"
-                            value={e.amount}
-                            onChange={(ev) => patchExpense(cy.id, e.id, { amount: ev.target.value })}
-                          />
-                          <select
-                            style={S.expCur}
-                            value={e.currency}
-                            onChange={(ev) => patchExpense(cy.id, e.id, { currency: ev.target.value })}
-                          >
+                          <input style={S.expLabel} placeholder="mis. beli wood, coal, metal…" value={e.label}
+                            onChange={ev => patchExpense(cy.id, e.id, { label: ev.target.value })} />
+                          <input style={S.expAmt} type="number" placeholder="0" value={e.amount}
+                            onChange={ev => patchExpense(cy.id, e.id, { amount: ev.target.value })} />
+                          <select style={S.expCur} value={e.currency}
+                            onChange={ev => patchExpense(cy.id, e.id, { currency: ev.target.value })}>
                             <option value={CUR.IDR}>IDR</option>
                             <option value={CUR.USD}>USD</option>
                           </select>
-                          <button style={S.expDel} onClick={() => removeExpense(cy.id, e.id)} aria-label="hapus">
-                            <Trash2 size={15} />
-                          </button>
+                          <button style={S.expDel} onClick={() => removeExpense(cy.id, e.id)}><Trash2 size={15} /></button>
                         </div>
                       ))}
                       <button style={S.addExp} onClick={() => addExpense(cy.id)}>
@@ -374,36 +502,26 @@ export default function ProfitTracker() {
                         <span><Coins size={13} style={{ verticalAlign: -2, marginRight: 5, color: "#d4a64a" }} />PENJUALAN GOLD</span>
                         <span style={S.sectionSum}>{fmtIDR(c.revenueIDR)}</span>
                       </div>
-                      <div className="gold-grid" style={S.goldGrid}>
+                      <div style={S.goldGrid}>
                         <div style={S.field}>
                           <label style={S.fieldLabel}>Jumlah Gold</label>
-                          <input
-                            style={S.fieldInput}
-                            type="number"
-                            placeholder="0"
-                            value={cy.goldQty}
-                            onChange={(e) => patchCycle(cy.id, { goldQty: e.target.value })}
-                          />
+                          <input style={S.fieldInput} type="number" placeholder="0" value={cy.goldQty}
+                            onChange={e => patchCycle(cy.id, { goldQty: e.target.value })} />
                         </div>
                         <div style={S.field}>
                           <label style={S.fieldLabel}>Harga / Gold (USD)</label>
-                          <input
-                            style={S.fieldInput}
-                            type="number"
-                            placeholder="0.00"
-                            value={cy.goldPrice}
-                            onChange={(e) => patchCycle(cy.id, { goldPrice: e.target.value })}
-                          />
+                          <input style={S.fieldInput} type="number" placeholder="0.00" value={cy.goldPrice}
+                            onChange={e => patchCycle(cy.id, { goldPrice: e.target.value })} />
                         </div>
                       </div>
                     </div>
 
                     {/* result */}
-                    <div className="result-grid" style={S.result}>
-                      <ResultCell label="Modal" value={fmtIDR(c.modalIDR)} />
-                      <ResultCell label="Revenue" value={fmtIDR(c.revenueIDR)} />
+                    <div style={S.result}>
+                      <ResultCell label="Modal"     value={fmtIDR(c.modalIDR)} />
+                      <ResultCell label="Revenue"   value={fmtIDR(c.revenueIDR)} />
                       <ResultCell label="Net Profit" value={fmtIDR(c.profitIDR)} strong tone={pos ? "good" : "bad"} />
-                      <ResultCell label="ROI" value={fmtPct(c.roi)} tone={pos ? "good" : "bad"} />
+                      <ResultCell label="ROI"       value={fmtPct(c.roi)}        tone={pos ? "good" : "bad"} />
                     </div>
                   </div>
                 )}
@@ -421,10 +539,10 @@ export default function ProfitTracker() {
         </footer>
       </div>
 
-      {/* ===== Kintara Import Modal ===== */}
+      {/* ======== Kintara Import Modal ======== */}
       {kintaraModal && (
         <div style={S.overlay} onClick={closeKintara}>
-          <div style={S.modal} onClick={(e) => e.stopPropagation()}>
+          <div style={S.modal} onClick={e => e.stopPropagation()}>
             <div style={S.modalHead}>
               <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                 <ShoppingCart size={18} color="#d4a64a" />
@@ -432,39 +550,24 @@ export default function ProfitTracker() {
               </div>
               <button style={S.modalClose} onClick={closeKintara}><X size={18} /></button>
             </div>
-
-            <p style={S.modalHint}>
-              Copy semua chat dari Marketplace di Kintara.gg, lalu paste di bawah ini.
-            </p>
-
-            <textarea
-              style={S.modalTextarea}
+            <p style={S.modalHint}>Copy semua chat dari Marketplace di Kintara.gg, lalu paste di bawah ini.</p>
+            <textarea style={S.modalTextarea} rows={8}
               placeholder={"You bought 1 Tool Pickaxe L2 for $0.48 USD (41.29 $KINS).\nMarketplace\nYou bought 1 Tool Axe L2 for $0.49 USD..."}
               value={kintaraPaste}
-              onChange={(e) => handleKintaraPaste(e.target.value)}
-              rows={8}
-            />
+              onChange={e => handleKintaraPaste(e.target.value)} />
 
-            {/* status */}
             {kintaraStatus === "empty" && (
-              <div style={S.statusBad}>
-                <AlertCircle size={14} /> Tidak ada transaksi yang dikenali. Pastikan format teks benar.
-              </div>
+              <div style={S.statusBad}><AlertCircle size={14} /> Tidak ada transaksi dikenali. Pastikan format teks benar.</div>
             )}
             {kintaraStatus === "ok" && (
-              <div style={S.statusOk}>
-                <CheckCircle2 size={14} /> Ditemukan {kintaraPreview.length} transaksi · Total ${kintaraTotalUSD.toFixed(2)} USD
-              </div>
+              <div style={S.statusOk}><CheckCircle2 size={14} /> Ditemukan {kintaraPreview.length} transaksi · Total ${kintaraTotalUSD.toFixed(2)} USD</div>
             )}
 
-            {/* preview list */}
             {kintaraPreview.length > 0 && (
               <div style={S.previewBox}>
-                <div style={S.previewHead}>
-                  <span>Item</span><span>Harga (USD)</span>
-                </div>
+                <div style={S.previewHead}><span>Item</span><span>Harga (USD)</span></div>
                 <div style={S.previewList}>
-                  {kintaraPreview.map((e) => (
+                  {kintaraPreview.map(e => (
                     <div key={e.id} style={S.previewRow}>
                       <span style={S.previewLabel}>{e.label}</span>
                       <span style={S.previewAmt}>${Number(e.amount).toFixed(2)}</span>
@@ -482,19 +585,20 @@ export default function ProfitTracker() {
               <button style={S.cancelBtn} onClick={closeKintara}>Batal</button>
               <button
                 style={{ ...S.confirmBtn, opacity: kintaraPreview.length ? 1 : 0.4, cursor: kintaraPreview.length ? "pointer" : "not-allowed" }}
-                onClick={confirmKintara}
-                disabled={!kintaraPreview.length}
-              >
+                onClick={confirmKintara} disabled={!kintaraPreview.length}>
                 <Plus size={15} /> Tambahkan {kintaraPreview.length > 0 ? `${kintaraPreview.length} item` : ""}
               </button>
             </div>
           </div>
         </div>
       )}
+
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
 }
 
+/* ---- Sub-components ---- */
 function SummaryCell({ label, value, tone, big }) {
   const color = tone === "good" ? "#5ccb85" : tone === "bad" ? "#e87a7d" : "#e6ebf1";
   return (
@@ -514,101 +618,138 @@ function ResultCell({ label, value, strong, tone }) {
   );
 }
 
+/* ---- Styles ---- */
 const mono = "'JetBrains Mono', monospace";
 const sans = "'Space Grotesk', sans-serif";
 const ACCENT = "#d4a64a";
+const PURPLE = "#a78bfa";
 
 const S = {
-  page: { minHeight: "100vh", position: "relative", overflow: "hidden", background: "#0e1116", color: "#e6ebf1", padding: "32px 16px 72px" },
-  glow: { position: "absolute", top: -160, left: "50%", transform: "translateX(-50%)", width: 720, height: 320, background: "radial-gradient(ellipse, rgba(212,166,74,0.13), transparent 70%)", pointerEvents: "none" },
-  wrap: { maxWidth: 880, margin: "0 auto", position: "relative" },
+  page:    { minHeight: "100vh", position: "relative", overflow: "hidden", background: "#0e1116", color: "#e6ebf1", padding: "32px 16px 72px" },
+  glow:    { position: "absolute", top: -160, left: "50%", transform: "translateX(-50%)", width: 720, height: 320, background: "radial-gradient(ellipse, rgba(212,166,74,0.13), transparent 70%)", pointerEvents: "none" },
+  wrap:    { maxWidth: 880, margin: "0 auto", position: "relative" },
 
-  header: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, flexWrap: "wrap", marginBottom: 26 },
-  brand: { display: "flex", alignItems: "center", gap: 13 },
-  logo: { width: 42, height: 42, borderRadius: 11, background: "linear-gradient(145deg, #2a2418, #1a1d24)", border: "1px solid #3a3526", display: "flex", alignItems: "center", justifyContent: "center", color: ACCENT, boxShadow: "0 0 20px rgba(212,166,74,0.15)" },
-  kicker: { fontSize: 10, letterSpacing: "0.3em", color: "#7d8694", fontWeight: 600, fontFamily: mono },
-  h1: { fontFamily: sans, fontSize: 30, fontWeight: 700, letterSpacing: "-0.02em", color: "#f2f5f9", lineHeight: 1.1 },
+  header:  { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 16, flexWrap: "wrap", marginBottom: 26 },
+  brand:   { display: "flex", alignItems: "center", gap: 13 },
+  logo:    { width: 42, height: 42, borderRadius: 11, background: "linear-gradient(145deg, #2a2418, #1a1d24)", border: "1px solid #3a3526", display: "flex", alignItems: "center", justifyContent: "center", color: ACCENT, boxShadow: "0 0 20px rgba(212,166,74,0.15)" },
+  kicker:  { fontSize: 10, letterSpacing: "0.3em", color: "#7d8694", fontWeight: 600, fontFamily: mono },
+  h1:      { fontFamily: sans, fontSize: 30, fontWeight: 700, letterSpacing: "-0.02em", color: "#f2f5f9", lineHeight: 1.1 },
 
-  toolbar: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
-  ghostBtn: { display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12.5, fontWeight: 500, color: "#9aa4b0", background: "#161b22", border: "1px solid #232a34", padding: "8px 12px", borderRadius: 9, cursor: "pointer", fontFamily: sans },
-  rateBox: { display: "flex", alignItems: "center", gap: 8, background: "#161b22", border: "1px solid #232a34", borderRadius: 9, padding: "5px 10px 5px 12px" },
-  rateLabel: { fontSize: 10, color: "#7d8694", fontWeight: 600, fontFamily: mono, letterSpacing: "0.05em" },
+  toolbar:       { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" },
+  ghostBtn:      { display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12.5, fontWeight: 500, color: "#9aa4b0", background: "#161b22", border: "1px solid #232a34", padding: "8px 12px", borderRadius: 9, cursor: "pointer", fontFamily: sans },
+  rateBox:       { display: "flex", alignItems: "center", gap: 8, background: "#161b22", border: "1px solid #232a34", borderRadius: 9, padding: "5px 10px 5px 12px" },
+  rateLabel:     { fontSize: 10, color: "#7d8694", fontWeight: 600, fontFamily: mono, letterSpacing: "0.05em" },
   rateInputWrap: { display: "flex", alignItems: "center" },
-  rsign: { fontSize: 12, color: "#6b7480", marginRight: 1, fontFamily: mono },
-  rsignSm: { fontSize: 11, color: "#6b7480", marginRight: 1, fontFamily: mono },
-  rateInput: { border: "none", background: "transparent", width: 78, fontSize: 14, fontWeight: 700, textAlign: "right", color: ACCENT, fontFamily: mono },
+  rsign:         { fontSize: 12, color: "#6b7480", marginRight: 1, fontFamily: mono },
+  rsignSm:       { fontSize: 11, color: "#6b7480", marginRight: 1, fontFamily: mono },
+  rateInput:     { border: "none", background: "transparent", width: 78, fontSize: 14, fontWeight: 700, textAlign: "right", color: ACCENT, fontFamily: mono },
 
-  summary: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 1, background: "#1d242e", border: "1px solid #1d242e", borderRadius: 14, overflow: "hidden", marginBottom: 14 },
-  sumCell: { background: "#13181f", padding: "16px 18px" },
+  summary:  { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 1, background: "#1d242e", border: "1px solid #1d242e", borderRadius: 14, overflow: "hidden", marginBottom: 14 },
+  sumCell:  { background: "#13181f", padding: "16px 18px" },
   sumLabel: { fontSize: 10, color: "#7d8694", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 7, fontFamily: mono },
   sumValue: { fontFamily: mono, fontWeight: 700, letterSpacing: "-0.01em" },
 
-  insights: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", padding: "10px 16px", background: "#11161d", border: "1px solid #1d242e", borderRadius: 10, marginBottom: 22, fontSize: 12.5, color: "#8993a0", fontFamily: mono },
-  insight: { display: "inline-flex", alignItems: "center", gap: 6 },
+  insights:       { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", padding: "10px 16px", background: "#11161d", border: "1px solid #1d242e", borderRadius: 10, marginBottom: 22, fontSize: 12.5, color: "#8993a0", fontFamily: mono },
+  insight:        { display: "inline-flex", alignItems: "center", gap: 6 },
   insightDivider: { width: 1, height: 14, background: "#283039" },
 
+  /* ---- Wallet Panel ---- */
+  walletPanel: { background: "#13181f", border: "1px solid #2a2d3d", borderRadius: 13, overflow: "hidden", marginBottom: 16 },
+  walletHead:  { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", cursor: "pointer", borderBottom: "1px solid #1c232d" },
+  walletTitle: { fontSize: 11, fontWeight: 700, color: PURPLE, letterSpacing: "0.15em", fontFamily: mono },
+  priceBadge:  { display: "inline-flex", alignItems: "center", gap: 6, background: "rgba(167,139,250,0.08)", border: "1px solid rgba(167,139,250,0.2)", borderRadius: 20, padding: "3px 10px", fontSize: 11.5, color: "#c4b5fd", fontFamily: mono },
+  priceDot:    { width: 7, height: 7, borderRadius: "50%", background: "#4ec27e", boxShadow: "0 0 6px #4ec27e", display: "inline-block" },
+  priceAgo:    { color: "#6b7480", fontSize: 10.5 },
+  refreshAllBtn: { display: "inline-flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 500, color: "#8993a0", background: "rgba(137,147,160,0.07)", border: "1px solid #2a3341", padding: "5px 10px", borderRadius: 7, cursor: "pointer", fontFamily: mono },
+
+  walletBody: { padding: "14px 16px 16px", display: "flex", flexDirection: "column", gap: 12 },
+
+  mintRow:        { display: "flex", flexDirection: "column", gap: 6 },
+  mintLabel:      { fontSize: 9.5, color: "#6b7480", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", fontFamily: mono },
+  mintInputGroup: { display: "flex", gap: 8 },
+  mintInput:      { flex: 1, background: "#0c1015", border: "1px solid #2a3341", borderRadius: 8, padding: "8px 12px", fontSize: 12, color: "#c4ccd6", fontFamily: mono, minWidth: 0 },
+  mintApplyBtn:   { border: "none", background: "linear-gradient(135deg, #6d52d4, #4f38a3)", color: "#fff", fontSize: 12, fontWeight: 600, padding: "8px 14px", borderRadius: 8, cursor: "pointer", fontFamily: sans },
+  mintHint:       { fontSize: 11, color: "#5d6672", fontFamily: sans, lineHeight: 1.6 },
+
+  walletList: { display: "flex", flexDirection: "column", gap: 8 },
+  walletRow:  { background: "#0c1015", border: "1px solid #1d242e", borderRadius: 10, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 8 },
+  walletRowTop: { display: "flex", gap: 8, alignItems: "center" },
+  walletRowBot: { display: "flex", alignItems: "center", gap: 10 },
+  walletName:       { width: 80, border: "none", background: "transparent", fontSize: 11, fontWeight: 700, color: PURPLE, fontFamily: mono, padding: 0 },
+  walletAddr:       { flex: 1, border: "1px solid #232a34", borderRadius: 7, padding: "7px 10px", fontSize: 11.5, background: "#0f141a", color: "#c4ccd6", fontFamily: mono, minWidth: 0 },
+  walletRefreshBtn: { border: "1px solid #2a3341", background: "transparent", color: "#6b7480", cursor: "pointer", display: "flex", padding: "6px 8px", borderRadius: 7 },
+  walletBalLabel:   { fontSize: 9.5, color: "#5d6672", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: mono },
+  walletBal:        { fontSize: 14, fontWeight: 700, color: "#c4b5fd", fontFamily: mono },
+  walletUSD:        { fontSize: 12, color: "#8993a0", fontFamily: mono },
+
+  walletTotal:      { display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", background: "rgba(167,139,250,0.06)", border: "1px solid rgba(167,139,250,0.15)", borderRadius: 10 },
+  walletTotalLabel: { fontSize: 10, fontWeight: 700, color: "#6b7480", letterSpacing: "0.1em", fontFamily: mono, textTransform: "uppercase" },
+  walletTotalKins:  { fontSize: 15, fontWeight: 700, color: "#c4b5fd", fontFamily: mono, marginLeft: 4 },
+  walletTotalSep:   { color: "#3a4350", fontSize: 16 },
+  walletTotalUSD:   { fontSize: 15, fontWeight: 700, color: ACCENT, fontFamily: mono },
+
+  /* ---- Cycles ---- */
   cycleList: { display: "flex", flexDirection: "column", gap: 12 },
-  card: { background: "#13181f", border: "1px solid #212834", borderRadius: 13, overflow: "hidden" },
-  cardHead: { display: "flex", alignItems: "center", gap: 10, padding: "13px 14px", cursor: "pointer" },
-  chev: { color: "#6b7480", display: "flex" },
+  card:      { background: "#13181f", border: "1px solid #212834", borderRadius: 13, overflow: "hidden" },
+  cardHead:  { display: "flex", alignItems: "center", gap: 10, padding: "13px 14px", cursor: "pointer" },
+  chev:      { color: "#6b7480", display: "flex" },
   cycleName: { border: "none", background: "transparent", fontFamily: sans, fontSize: 17, fontWeight: 600, color: "#eef2f6", width: 130, padding: "2px 4px", borderRadius: 6 },
   headStats: { marginLeft: "auto", display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" },
-  headStat: { fontSize: 12.5, color: "#7d8694", fontFamily: mono },
-  headProfit: { display: "inline-flex", alignItems: "center", gap: 5, fontSize: 14, fontWeight: 700, fontFamily: mono },
-  delCycle: { border: "none", background: "transparent", color: "#5a4a4a", cursor: "pointer", display: "flex", padding: 4, borderRadius: 6 },
+  headStat:  { fontSize: 12.5, color: "#7d8694", fontFamily: mono },
+  headProfit:{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 14, fontWeight: 700, fontFamily: mono },
+  delCycle:  { border: "none", background: "transparent", color: "#5a4a4a", cursor: "pointer", display: "flex", padding: 4, borderRadius: 6 },
 
-  cardBody: { padding: "2px 16px 18px", borderTop: "1px solid #1c232d" },
-  bodyRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 0 2px" },
-  bodyLabel: { fontSize: 11.5, color: "#7d8694", fontWeight: 500, fontFamily: mono },
-  inlineRate: { display: "flex", alignItems: "center", background: "#0f141a", border: "1px solid #232a34", borderRadius: 7, padding: "4px 8px" },
+  cardBody:    { padding: "2px 16px 18px", borderTop: "1px solid #1c232d" },
+  bodyRow:     { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 0 2px" },
+  bodyLabel:   { fontSize: 11.5, color: "#7d8694", fontWeight: 500, fontFamily: mono },
+  inlineRate:  { display: "flex", alignItems: "center", background: "#0f141a", border: "1px solid #232a34", borderRadius: 7, padding: "4px 8px" },
   rateInputSm: { border: "none", background: "transparent", width: 76, fontSize: 12.5, fontWeight: 600, textAlign: "right", color: "#c4ccd6", fontFamily: mono },
 
-  section: { marginTop: 15 },
+  section:      { marginTop: 15 },
   sectionTitle: { display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, fontWeight: 700, color: "#9aa4b0", letterSpacing: "0.12em", marginBottom: 9, paddingBottom: 7, borderBottom: "1px solid #1c232d", fontFamily: mono },
-  sectionSum: { fontFamily: mono, fontWeight: 700, color: ACCENT, letterSpacing: 0 },
-
-  kintaraBtn: { display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, fontWeight: 600, color: "#d4a64a", background: "rgba(212,166,74,0.08)", border: "1px solid rgba(212,166,74,0.25)", padding: "4px 9px", borderRadius: 6, cursor: "pointer", fontFamily: mono, letterSpacing: "0.04em" },
+  sectionSum:   { fontFamily: mono, fontWeight: 700, color: ACCENT, letterSpacing: 0 },
+  kintaraBtn:   { display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, fontWeight: 600, color: ACCENT, background: "rgba(212,166,74,0.08)", border: "1px solid rgba(212,166,74,0.25)", padding: "4px 9px", borderRadius: 6, cursor: "pointer", fontFamily: mono, letterSpacing: "0.04em" },
 
   expHeadRow: { display: "flex", gap: 8, fontSize: 9.5, color: "#5d6672", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", padding: "0 0 5px", fontFamily: mono },
-  expRow: { display: "flex", gap: 8, alignItems: "center", marginBottom: 6 },
-  expLabel: { flex: 1, border: "1px solid #232a34", borderRadius: 7, padding: "8px 10px", fontSize: 13, background: "#0f141a", color: "#e6ebf1", fontFamily: sans, minWidth: 0 },
-  expAmt: { width: 120, border: "1px solid #232a34", borderRadius: 7, padding: "8px 10px", fontSize: 13, textAlign: "right", background: "#0f141a", color: "#e6ebf1", fontFamily: mono },
-  expCur: { width: 66, border: "1px solid #232a34", borderRadius: 7, padding: "8px 4px", fontSize: 12, background: "#0f141a", color: "#c4ccd6", cursor: "pointer", fontFamily: mono },
-  expDel: { width: 28, border: "none", background: "transparent", color: "#5a6470", cursor: "pointer", display: "flex", justifyContent: "center", padding: 4 },
-  empty: { fontSize: 12, color: "#5d6672", fontStyle: "italic", padding: "4px 0 8px" },
-  addExp: { display: "inline-flex", alignItems: "center", gap: 5, marginTop: 5, border: "1px dashed #3a4350", background: "transparent", color: "#8993a0", fontSize: 12.5, fontWeight: 500, padding: "8px 13px", borderRadius: 8, cursor: "pointer", fontFamily: sans },
+  expRow:     { display: "flex", gap: 8, alignItems: "center", marginBottom: 6 },
+  expLabel:   { flex: 1, border: "1px solid #232a34", borderRadius: 7, padding: "8px 10px", fontSize: 13, background: "#0f141a", color: "#e6ebf1", fontFamily: sans, minWidth: 0 },
+  expAmt:     { width: 120, border: "1px solid #232a34", borderRadius: 7, padding: "8px 10px", fontSize: 13, textAlign: "right", background: "#0f141a", color: "#e6ebf1", fontFamily: mono },
+  expCur:     { width: 66, border: "1px solid #232a34", borderRadius: 7, padding: "8px 4px", fontSize: 12, background: "#0f141a", color: "#c4ccd6", cursor: "pointer", fontFamily: mono },
+  expDel:     { width: 28, border: "none", background: "transparent", color: "#5a6470", cursor: "pointer", display: "flex", justifyContent: "center", padding: 4 },
+  empty:      { fontSize: 12, color: "#5d6672", fontStyle: "italic", padding: "4px 0 8px" },
+  addExp:     { display: "inline-flex", alignItems: "center", gap: 5, marginTop: 5, border: "1px dashed #3a4350", background: "transparent", color: "#8993a0", fontSize: 12.5, fontWeight: 500, padding: "8px 13px", borderRadius: 8, cursor: "pointer", fontFamily: sans },
 
-  goldGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 },
-  field: { display: "flex", flexDirection: "column", gap: 5 },
+  goldGrid:   { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 },
+  field:      { display: "flex", flexDirection: "column", gap: 5 },
   fieldLabel: { fontSize: 11, color: "#7d8694", fontWeight: 500, fontFamily: mono },
   fieldInput: { border: "1px solid #232a34", borderRadius: 7, padding: "9px 11px", fontSize: 14, background: "#0f141a", color: "#e6ebf1", fontFamily: mono },
 
-  result: { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 1, marginTop: 16, background: "#1d242e", border: "1px solid #1d242e", borderRadius: 10, overflow: "hidden" },
-  resCell: { background: "#0f141a", padding: "11px 13px" },
+  result:   { display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 1, marginTop: 16, background: "#1d242e", border: "1px solid #1d242e", borderRadius: 10, overflow: "hidden" },
+  resCell:  { background: "#0f141a", padding: "11px 13px" },
   resLabel: { fontSize: 9.5, color: "#6b7480", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 4, fontFamily: mono },
   resValue: { fontSize: 14.5, fontFamily: mono },
 
   addCycle: { display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", marginTop: 16, padding: "14px", border: `1px solid ${ACCENT}`, background: "linear-gradient(180deg, rgba(212,166,74,0.16), rgba(212,166,74,0.06))", color: ACCENT, fontSize: 15, fontWeight: 600, borderRadius: 12, cursor: "pointer", fontFamily: sans, letterSpacing: "0.01em" },
-  footer: { marginTop: 26, fontSize: 11.5, color: "#5d6672", textAlign: "center", lineHeight: 1.7, fontFamily: sans },
+  footer:   { marginTop: 26, fontSize: 11.5, color: "#5d6672", textAlign: "center", lineHeight: 1.7, fontFamily: sans },
 
   /* modal */
-  overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(4px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16 },
-  modal: { background: "#13181f", border: "1px solid #2a3341", borderRadius: 16, width: "100%", maxWidth: 560, maxHeight: "90vh", overflow: "auto", padding: 24, display: "flex", flexDirection: "column", gap: 16 },
-  modalHead: { display: "flex", alignItems: "center", justifyContent: "space-between" },
-  modalTitle: { fontFamily: sans, fontSize: 17, fontWeight: 700, color: "#eef2f6" },
-  modalClose: { border: "none", background: "transparent", color: "#6b7480", cursor: "pointer", display: "flex", padding: 4, borderRadius: 6 },
-  modalHint: { fontSize: 12.5, color: "#8993a0", fontFamily: sans, lineHeight: 1.6, margin: 0 },
+  overlay:       { position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(4px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16 },
+  modal:         { background: "#13181f", border: "1px solid #2a3341", borderRadius: 16, width: "100%", maxWidth: 560, maxHeight: "90vh", overflow: "auto", padding: 24, display: "flex", flexDirection: "column", gap: 16 },
+  modalHead:     { display: "flex", alignItems: "center", justifyContent: "space-between" },
+  modalTitle:    { fontFamily: sans, fontSize: 17, fontWeight: 700, color: "#eef2f6" },
+  modalClose:    { border: "none", background: "transparent", color: "#6b7480", cursor: "pointer", display: "flex", padding: 4, borderRadius: 6 },
+  modalHint:     { fontSize: 12.5, color: "#8993a0", fontFamily: sans, lineHeight: 1.6, margin: 0 },
   modalTextarea: { width: "100%", background: "#0c1015", border: "1px solid #232a34", borderRadius: 10, padding: "12px 14px", fontSize: 12.5, color: "#c4ccd6", fontFamily: mono, resize: "vertical", lineHeight: 1.7, boxSizing: "border-box" },
-  statusOk: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: "#5ccb85", fontFamily: mono, background: "rgba(92,203,133,0.07)", border: "1px solid rgba(92,203,133,0.2)", borderRadius: 8, padding: "9px 12px" },
-  statusBad: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: "#e87a7d", fontFamily: mono, background: "rgba(232,122,125,0.07)", border: "1px solid rgba(232,122,125,0.2)", borderRadius: 8, padding: "9px 12px" },
-  previewBox: { background: "#0c1015", border: "1px solid #1d242e", borderRadius: 10, overflow: "hidden" },
-  previewHead: { display: "flex", justifyContent: "space-between", padding: "8px 12px", fontSize: 9.5, color: "#5d6672", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.07em", fontFamily: mono, borderBottom: "1px solid #1a212b" },
-  previewList: { maxHeight: 200, overflowY: "auto" },
-  previewRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 12px", borderBottom: "1px solid #131920" },
-  previewLabel: { fontSize: 12.5, color: "#c4ccd6", fontFamily: sans },
-  previewAmt: { fontSize: 12.5, color: "#d4a64a", fontFamily: mono, fontWeight: 600 },
-  previewTotal: { display: "flex", justifyContent: "space-between", padding: "10px 12px", fontSize: 13, fontFamily: mono, fontWeight: 600, color: "#9aa4b0", borderTop: "1px solid #1d242e" },
-  modalActions: { display: "flex", gap: 10, justifyContent: "flex-end" },
-  cancelBtn: { border: "1px solid #2a3341", background: "transparent", color: "#8993a0", fontSize: 13.5, fontWeight: 500, padding: "10px 18px", borderRadius: 9, cursor: "pointer", fontFamily: sans },
-  confirmBtn: { display: "inline-flex", alignItems: "center", gap: 6, border: "none", background: "linear-gradient(135deg, #c49030, #a07228)", color: "#fff", fontSize: 13.5, fontWeight: 600, padding: "10px 20px", borderRadius: 9, fontFamily: sans },
+  statusOk:      { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: "#5ccb85", fontFamily: mono, background: "rgba(92,203,133,0.07)", border: "1px solid rgba(92,203,133,0.2)", borderRadius: 8, padding: "9px 12px" },
+  statusBad:     { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: "#e87a7d", fontFamily: mono, background: "rgba(232,122,125,0.07)", border: "1px solid rgba(232,122,125,0.2)", borderRadius: 8, padding: "9px 12px" },
+  previewBox:    { background: "#0c1015", border: "1px solid #1d242e", borderRadius: 10, overflow: "hidden" },
+  previewHead:   { display: "flex", justifyContent: "space-between", padding: "8px 12px", fontSize: 9.5, color: "#5d6672", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.07em", fontFamily: mono, borderBottom: "1px solid #1a212b" },
+  previewList:   { maxHeight: 200, overflowY: "auto" },
+  previewRow:    { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 12px", borderBottom: "1px solid #131920" },
+  previewLabel:  { fontSize: 12.5, color: "#c4ccd6", fontFamily: sans },
+  previewAmt:    { fontSize: 12.5, color: ACCENT, fontFamily: mono, fontWeight: 600 },
+  previewTotal:  { display: "flex", justifyContent: "space-between", padding: "10px 12px", fontSize: 13, fontFamily: mono, fontWeight: 600, color: "#9aa4b0", borderTop: "1px solid #1d242e" },
+  modalActions:  { display: "flex", gap: 10, justifyContent: "flex-end" },
+  cancelBtn:     { border: "1px solid #2a3341", background: "transparent", color: "#8993a0", fontSize: 13.5, fontWeight: 500, padding: "10px 18px", borderRadius: 9, cursor: "pointer", fontFamily: sans },
+  confirmBtn:    { display: "inline-flex", alignItems: "center", gap: 6, border: "none", background: "linear-gradient(135deg, #c49030, #a07228)", color: "#fff", fontSize: 13.5, fontWeight: 600, padding: "10px 20px", borderRadius: 9, fontFamily: sans },
 };
