@@ -75,10 +75,10 @@ async function fetchKinsPrice(mint) {
 }
 
 const SOLANA_RPCS = [
-  "https://api.mainnet-beta.solana.com",
+  "https://mainnet.helius-rpc.com/?api-key=1db05468-e227-45cf-bd9f-cea0534b1f18",
   "https://rpc.ankr.com/solana",
   "https://solana-rpc.publicnode.com",
-  "https://mainnet.helius-rpc.com/?api-key=1d8ae86e-c4c9-4c8b-af3a-9e0c0f3c9b2a",
+  "https://mainnet.helius-rpc.com/?api-key=1db05468-e227-45cf-bd9f-cea0534b1f18",
 ];
 
 async function fetchKinsBalance(walletAddr, mintAddr) {
