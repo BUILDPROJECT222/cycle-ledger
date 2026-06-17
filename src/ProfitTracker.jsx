@@ -47,7 +47,7 @@ function seedData() {
 }
 
 function newWallet(n) {
-  return { id: crypto.randomUUID(), name: `Akun ${n}`, address: "", kinsBalance: null, loading: false, error: null };
+  return { id: crypto.randomUUID(), name: `Akun ${n}`, address: "", kinsBalance: null, solBalance: null, loading: false, error: null };
 }
 
 /* ---------- Kintara chat parser ---------- */
@@ -80,6 +80,27 @@ const SOLANA_RPCS = [
   "https://solana-rpc.publicnode.com",
   "https://mainnet.helius-rpc.com/?api-key=1db05468-e227-45cf-bd9f-cea0534b1f18",
 ];
+
+async function fetchSolBalance(walletAddr) {
+  if (!walletAddr?.trim()) return null;
+  for (const rpc of SOLANA_RPCS) {
+    try {
+      const r = await fetch(rpc, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1,
+          method: "getBalance",
+          params: [walletAddr.trim()],
+        }),
+      });
+      const d = await r.json();
+      if (d.error || d.result?.value == null) continue;
+      return d.result.value / 1_000_000_000; // lamports → SOL
+    } catch { continue; }
+  }
+  return null;
+}
 
 async function fetchKinsBalance(walletAddr, mintAddr) {
   if (!walletAddr?.trim() || !mintAddr?.trim()) return null;
@@ -159,12 +180,16 @@ export default function ProfitTracker() {
   /* ---------- wallet balance helpers ---------- */
   const refreshWallet = async (walletId) => {
     const w = wallets.find(x => x.id === walletId);
-    if (!w?.address.trim() || !kinsMint.trim()) return;
+    if (!w?.address.trim()) return;
     setWallets(p => p.map(x => x.id === walletId ? { ...x, loading: true, error: null } : x));
-    const bal = await fetchKinsBalance(w.address, kinsMint);
+    const [kinsBal, solBal] = await Promise.all([
+      kinsMint.trim() ? fetchKinsBalance(w.address, kinsMint) : Promise.resolve(null),
+      fetchSolBalance(w.address),
+    ]);
     setWallets(p => p.map(x =>
       x.id === walletId
-        ? { ...x, kinsBalance: bal, loading: false, error: bal === null ? "Gagal fetch — cek alamat atau coba lagi" : null }
+        ? { ...x, kinsBalance: kinsBal, solBalance: solBal, loading: false,
+            error: solBal === null && kinsBal === null ? "Gagal fetch — cek alamat atau coba lagi" : null }
         : x
     ));
   };
@@ -377,7 +402,7 @@ export default function ProfitTracker() {
               {/* Wallet rows */}
               <div style={S.walletList}>
                 {wallets.map((w) => {
-                  const usdVal = kinsPrice != null && w.kinsBalance != null ? w.kinsBalance * kinsPrice : null;
+                  const kinsUSD = kinsPrice != null && w.kinsBalance != null ? w.kinsBalance * kinsPrice : null;
                   return (
                     <div key={w.id} style={S.walletRow}>
                       <div style={S.walletRowTop}>
@@ -391,35 +416,40 @@ export default function ProfitTracker() {
                           style={S.walletAddr}
                           value={w.address}
                           onChange={e => patchWallet(w.id, { address: e.target.value })}
-                          onBlur={() => w.address.trim().length > 30 && kinsMint && refreshWallet(w.id)}
+                          onBlur={() => w.address.trim().length > 30 && refreshWallet(w.id)}
                           placeholder="Alamat wallet Solana (pubkey)…"
                           spellCheck={false}
                         />
                         <button
                           style={S.walletRefreshBtn}
                           onClick={() => refreshWallet(w.id)}
-                          disabled={!w.address.trim() || !kinsMint}
+                          disabled={!w.address.trim()}
                           title="Refresh balance"
                         >
                           <RefreshCw size={13} style={w.loading ? { animation: "spin 1s linear infinite" } : {}} />
                         </button>
-                        <button
-                          style={S.walletDelBtn}
-                          onClick={() => removeWallet(w.id)}
-                          title="Hapus wallet"
-                        >
+                        <button style={S.walletDelBtn} onClick={() => removeWallet(w.id)} title="Hapus wallet">
                           <X size={13} />
                         </button>
                       </div>
                       <div style={S.walletRowBot}>
                         {w.error ? (
                           <span style={{ color: "#e87a7d", fontSize: 11.5, fontFamily: mono }}>{w.error}</span>
+                        ) : w.loading ? (
+                          <span style={{ color: "#6b7480", fontSize: 12, fontFamily: mono }}>Mengambil data…</span>
                         ) : (
                           <>
+                            {/* SOL */}
+                            <span style={S.walletBalLabel}>SOL</span>
+                            <span style={{ ...S.walletBal, color: "#60d5fa" }}>
+                              {w.solBalance != null ? w.solBalance.toFixed(4) : "—"}
+                            </span>
+                            <span style={S.walletSep}>·</span>
+                            {/* KINS */}
                             <span style={S.walletBalLabel}>KINS</span>
-                            <span style={S.walletBal}>{w.loading ? "…" : fmtKins(w.kinsBalance)}</span>
-                            {usdVal != null && !w.loading && (
-                              <span style={S.walletUSD}>≈ {fmtUSD(usdVal)}</span>
+                            <span style={S.walletBal}>{fmtKins(w.kinsBalance)}</span>
+                            {kinsUSD != null && (
+                              <span style={S.walletUSD}>≈ {fmtUSD(kinsUSD)}</span>
                             )}
                           </>
                         )}
@@ -706,6 +736,7 @@ const S = {
   walletBalLabel:   { fontSize: 9.5, color: "#5d6672", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: mono },
   walletBal:        { fontSize: 14, fontWeight: 700, color: "#c4b5fd", fontFamily: mono },
   walletUSD:        { fontSize: 12, color: "#8993a0", fontFamily: mono },
+  walletSep:        { color: "#2a3341", fontSize: 16, margin: "0 4px" },
 
   walletTotal:      { display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", background: "rgba(167,139,250,0.06)", border: "1px solid rgba(167,139,250,0.15)", borderRadius: 10 },
   walletTotalLabel: { fontSize: 10, fontWeight: 700, color: "#6b7480", letterSpacing: "0.1em", fontFamily: mono, textTransform: "uppercase" },
