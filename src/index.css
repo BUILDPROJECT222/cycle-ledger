@@ -1,0 +1,38 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root { height: 100%; }
+
+body {
+  background: #0e1116;
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+input, select, button { font-family: inherit; }
+
+input:focus, select:focus {
+  outline: 1.5px solid #d4a64a;
+  outline-offset: 1px;
+}
+
+input::placeholder { color: #4a5260; }
+
+/* number input cleanup */
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button {
+  -webkit-appearance: none; margin: 0;
+}
+input[type=number] { -moz-appearance: textfield; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #141922; }
+::-webkit-scrollbar-thumb { background: #2a3340; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #3a4654; }
+
+@media (max-width: 640px){
+  .summary-grid { grid-template-columns: 1fr 1fr !important; }
+  .result-grid { grid-template-columns: 1fr 1fr !important; }
+  .gold-grid { grid-template-columns: 1fr !important; }
+}
