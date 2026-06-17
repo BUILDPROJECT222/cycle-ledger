@@ -294,6 +294,7 @@ export default function ProfitTracker() {
 
   /* ---------- wallet totals ---------- */
   const totalKins    = wallets.reduce((s, w) => s + (w.kinsBalance || 0), 0);
+  const totalSol     = wallets.reduce((s, w) => s + (w.solBalance  || 0), 0);
   const totalKinsUSD = kinsPrice != null ? totalKins * kinsPrice : null;
   const kintaraTotalUSD = kintaraPreview.reduce((s, e) => s + Number(e.amount), 0);
 
@@ -465,10 +466,17 @@ export default function ProfitTracker() {
 
               {/* Total row */}
               <div style={S.walletTotal}>
+                <span style={S.walletTotalLabel}>TOTAL SOL</span>
+                <span style={{ ...S.walletTotalKins, color: "#60d5fa" }}>{totalSol.toFixed(4)}</span>
+                <span style={S.walletTotalSep}>·</span>
                 <span style={S.walletTotalLabel}>TOTAL KINS</span>
                 <span style={S.walletTotalKins}>{fmtKins(totalKins)}</span>
-                <span style={S.walletTotalSep}>·</span>
-                <span style={S.walletTotalUSD}>{totalKinsUSD != null ? fmtUSD(totalKinsUSD) : "—"}</span>
+                {totalKinsUSD != null && (
+                  <>
+                    <span style={S.walletTotalSep}>·</span>
+                    <span style={S.walletTotalUSD}>{fmtUSD(totalKinsUSD)}</span>
+                  </>
+                )}
               </div>
             </div>
           )}
