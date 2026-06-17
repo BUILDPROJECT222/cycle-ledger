@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import {
   Plus, Trash2, ChevronDown, ChevronRight, TrendingUp, TrendingDown,
-  Coins, Pickaxe, X, Download, Upload,
+  Coins, Pickaxe, X, Download, Upload, ShoppingCart, AlertCircle, CheckCircle2,
 } from "lucide-react";
 
 /* ---------- formatting ---------- */
@@ -23,7 +23,7 @@ const newCycle = (n, rate) => ({
 const STORAGE_KEY = "cycle_ledger_v1";
 const RATE_KEY = "cycle_ledger_rate_v1";
 
-/* localStorage helpers (real website build) */
+/* localStorage helpers */
 const load = (k, fallback) => {
   try {
     const v = localStorage.getItem(k);
@@ -49,6 +49,21 @@ function seedData() {
   return [c];
 }
 
+/* ---------- Kintara parser ---------- */
+function parseKintara(text) {
+  const pattern = /You bought (\d+) (.+?) for \$([\d.]+) USD/g;
+  const results = [];
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    const qty = parseInt(match[1], 10);
+    const item = match[2].trim();
+    const price = parseFloat(match[3]);
+    const label = qty > 1 ? `${qty}x ${item}` : item;
+    results.push({ id: crypto.randomUUID(), label, amount: price, currency: CUR.USD });
+  }
+  return results;
+}
+
 export default function ProfitTracker() {
   const [defaultRate, setDefaultRate] = useState(() => load(RATE_KEY, 17800));
   const [cycles, setCycles] = useState(() => load(STORAGE_KEY, null) || seedData());
@@ -56,6 +71,12 @@ export default function ProfitTracker() {
     const c = load(STORAGE_KEY, null) || seedData();
     return Object.fromEntries(c.map((x, i) => [x.id, i === c.length - 1]));
   });
+
+  /* import kintara modal state */
+  const [kintaraModal, setKintaraModal] = useState(null); // { cycleId }
+  const [kintaraPaste, setKintaraPaste] = useState("");
+  const [kintaraPreview, setKintaraPreview] = useState([]);
+  const [kintaraStatus, setKintaraStatus] = useState(null); // "ok" | "empty"
 
   useEffect(() => save(STORAGE_KEY, cycles), [cycles]);
   useEffect(() => save(RATE_KEY, defaultRate), [defaultRate]);
@@ -150,9 +171,42 @@ export default function ProfitTracker() {
     e.target.value = "";
   };
 
+  /* kintara modal handlers */
+  const openKintara = (cycleId) => {
+    setKintaraModal({ cycleId });
+    setKintaraPaste("");
+    setKintaraPreview([]);
+    setKintaraStatus(null);
+  };
+  const closeKintara = () => {
+    setKintaraModal(null);
+    setKintaraPaste("");
+    setKintaraPreview([]);
+    setKintaraStatus(null);
+  };
+  const handleKintaraPaste = (text) => {
+    setKintaraPaste(text);
+    const parsed = parseKintara(text);
+    setKintaraPreview(parsed);
+    setKintaraStatus(parsed.length > 0 ? "ok" : text.trim() ? "empty" : null);
+  };
+  const confirmKintara = () => {
+    if (!kintaraPreview.length || !kintaraModal) return;
+    const { cycleId } = kintaraModal;
+    setCycles((p) =>
+      p.map((c) =>
+        c.id === cycleId
+          ? { ...c, expenses: [...c.expenses, ...kintaraPreview] }
+          : c
+      )
+    );
+    closeKintara();
+  };
+
+  const kintaraTotalUSD = kintaraPreview.reduce((s, e) => s + Number(e.amount), 0);
+
   return (
     <div style={S.page}>
-      {/* ambient grid glow */}
       <div style={S.glow} />
       <div style={S.wrap}>
         <header style={S.header}>
@@ -259,7 +313,16 @@ export default function ProfitTracker() {
                     <div style={S.section}>
                       <div style={S.sectionTitle}>
                         <span>PENGELUARAN</span>
-                        <span style={S.sectionSum}>{fmtIDR(c.modalIDR)}</span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                          <button
+                            style={S.kintaraBtn}
+                            onClick={(e) => { e.stopPropagation(); openKintara(cy.id); }}
+                            title="Import pembelian dari Kintara.gg"
+                          >
+                            <ShoppingCart size={12} /> Import Kintara
+                          </button>
+                          <span style={S.sectionSum}>{fmtIDR(c.modalIDR)}</span>
+                        </div>
                       </div>
                       {cy.expenses.length > 0 && (
                         <div style={S.expHeadRow}>
@@ -357,6 +420,77 @@ export default function ProfitTracker() {
           Data tersimpan otomatis di browser ini. Gunakan <b style={{ color: "#9aa4b0" }}>Backup</b> untuk menyimpan salinan, lalu <b style={{ color: "#9aa4b0" }}>Muat</b> untuk memulihkan di perangkat lain.
         </footer>
       </div>
+
+      {/* ===== Kintara Import Modal ===== */}
+      {kintaraModal && (
+        <div style={S.overlay} onClick={closeKintara}>
+          <div style={S.modal} onClick={(e) => e.stopPropagation()}>
+            <div style={S.modalHead}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <ShoppingCart size={18} color="#d4a64a" />
+                <span style={S.modalTitle}>Import dari Kintara.gg</span>
+              </div>
+              <button style={S.modalClose} onClick={closeKintara}><X size={18} /></button>
+            </div>
+
+            <p style={S.modalHint}>
+              Copy semua chat dari Marketplace di Kintara.gg, lalu paste di bawah ini.
+            </p>
+
+            <textarea
+              style={S.modalTextarea}
+              placeholder={"You bought 1 Tool Pickaxe L2 for $0.48 USD (41.29 $KINS).\nMarketplace\nYou bought 1 Tool Axe L2 for $0.49 USD..."}
+              value={kintaraPaste}
+              onChange={(e) => handleKintaraPaste(e.target.value)}
+              rows={8}
+            />
+
+            {/* status */}
+            {kintaraStatus === "empty" && (
+              <div style={S.statusBad}>
+                <AlertCircle size={14} /> Tidak ada transaksi yang dikenali. Pastikan format teks benar.
+              </div>
+            )}
+            {kintaraStatus === "ok" && (
+              <div style={S.statusOk}>
+                <CheckCircle2 size={14} /> Ditemukan {kintaraPreview.length} transaksi · Total ${kintaraTotalUSD.toFixed(2)} USD
+              </div>
+            )}
+
+            {/* preview list */}
+            {kintaraPreview.length > 0 && (
+              <div style={S.previewBox}>
+                <div style={S.previewHead}>
+                  <span>Item</span><span>Harga (USD)</span>
+                </div>
+                <div style={S.previewList}>
+                  {kintaraPreview.map((e) => (
+                    <div key={e.id} style={S.previewRow}>
+                      <span style={S.previewLabel}>{e.label}</span>
+                      <span style={S.previewAmt}>${Number(e.amount).toFixed(2)}</span>
+                    </div>
+                  ))}
+                </div>
+                <div style={S.previewTotal}>
+                  <span>Total</span>
+                  <span style={{ color: "#d4a64a", fontWeight: 700 }}>${kintaraTotalUSD.toFixed(2)} USD</span>
+                </div>
+              </div>
+            )}
+
+            <div style={S.modalActions}>
+              <button style={S.cancelBtn} onClick={closeKintara}>Batal</button>
+              <button
+                style={{ ...S.confirmBtn, opacity: kintaraPreview.length ? 1 : 0.4, cursor: kintaraPreview.length ? "pointer" : "not-allowed" }}
+                onClick={confirmKintara}
+                disabled={!kintaraPreview.length}
+              >
+                <Plus size={15} /> Tambahkan {kintaraPreview.length > 0 ? `${kintaraPreview.length} item` : ""}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -433,6 +567,8 @@ const S = {
   sectionTitle: { display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, fontWeight: 700, color: "#9aa4b0", letterSpacing: "0.12em", marginBottom: 9, paddingBottom: 7, borderBottom: "1px solid #1c232d", fontFamily: mono },
   sectionSum: { fontFamily: mono, fontWeight: 700, color: ACCENT, letterSpacing: 0 },
 
+  kintaraBtn: { display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, fontWeight: 600, color: "#d4a64a", background: "rgba(212,166,74,0.08)", border: "1px solid rgba(212,166,74,0.25)", padding: "4px 9px", borderRadius: 6, cursor: "pointer", fontFamily: mono, letterSpacing: "0.04em" },
+
   expHeadRow: { display: "flex", gap: 8, fontSize: 9.5, color: "#5d6672", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", padding: "0 0 5px", fontFamily: mono },
   expRow: { display: "flex", gap: 8, alignItems: "center", marginBottom: 6 },
   expLabel: { flex: 1, border: "1px solid #232a34", borderRadius: 7, padding: "8px 10px", fontSize: 13, background: "#0f141a", color: "#e6ebf1", fontFamily: sans, minWidth: 0 },
@@ -454,4 +590,25 @@ const S = {
 
   addCycle: { display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", marginTop: 16, padding: "14px", border: `1px solid ${ACCENT}`, background: "linear-gradient(180deg, rgba(212,166,74,0.16), rgba(212,166,74,0.06))", color: ACCENT, fontSize: 15, fontWeight: 600, borderRadius: 12, cursor: "pointer", fontFamily: sans, letterSpacing: "0.01em" },
   footer: { marginTop: 26, fontSize: 11.5, color: "#5d6672", textAlign: "center", lineHeight: 1.7, fontFamily: sans },
+
+  /* modal */
+  overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", backdropFilter: "blur(4px)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16 },
+  modal: { background: "#13181f", border: "1px solid #2a3341", borderRadius: 16, width: "100%", maxWidth: 560, maxHeight: "90vh", overflow: "auto", padding: 24, display: "flex", flexDirection: "column", gap: 16 },
+  modalHead: { display: "flex", alignItems: "center", justifyContent: "space-between" },
+  modalTitle: { fontFamily: sans, fontSize: 17, fontWeight: 700, color: "#eef2f6" },
+  modalClose: { border: "none", background: "transparent", color: "#6b7480", cursor: "pointer", display: "flex", padding: 4, borderRadius: 6 },
+  modalHint: { fontSize: 12.5, color: "#8993a0", fontFamily: sans, lineHeight: 1.6, margin: 0 },
+  modalTextarea: { width: "100%", background: "#0c1015", border: "1px solid #232a34", borderRadius: 10, padding: "12px 14px", fontSize: 12.5, color: "#c4ccd6", fontFamily: mono, resize: "vertical", lineHeight: 1.7, boxSizing: "border-box" },
+  statusOk: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: "#5ccb85", fontFamily: mono, background: "rgba(92,203,133,0.07)", border: "1px solid rgba(92,203,133,0.2)", borderRadius: 8, padding: "9px 12px" },
+  statusBad: { display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: "#e87a7d", fontFamily: mono, background: "rgba(232,122,125,0.07)", border: "1px solid rgba(232,122,125,0.2)", borderRadius: 8, padding: "9px 12px" },
+  previewBox: { background: "#0c1015", border: "1px solid #1d242e", borderRadius: 10, overflow: "hidden" },
+  previewHead: { display: "flex", justifyContent: "space-between", padding: "8px 12px", fontSize: 9.5, color: "#5d6672", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.07em", fontFamily: mono, borderBottom: "1px solid #1a212b" },
+  previewList: { maxHeight: 200, overflowY: "auto" },
+  previewRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 12px", borderBottom: "1px solid #131920" },
+  previewLabel: { fontSize: 12.5, color: "#c4ccd6", fontFamily: sans },
+  previewAmt: { fontSize: 12.5, color: "#d4a64a", fontFamily: mono, fontWeight: 600 },
+  previewTotal: { display: "flex", justifyContent: "space-between", padding: "10px 12px", fontSize: 13, fontFamily: mono, fontWeight: 600, color: "#9aa4b0", borderTop: "1px solid #1d242e" },
+  modalActions: { display: "flex", gap: 10, justifyContent: "flex-end" },
+  cancelBtn: { border: "1px solid #2a3341", background: "transparent", color: "#8993a0", fontSize: 13.5, fontWeight: 500, padding: "10px 18px", borderRadius: 9, cursor: "pointer", fontFamily: sans },
+  confirmBtn: { display: "inline-flex", alignItems: "center", gap: 6, border: "none", background: "linear-gradient(135deg, #c49030, #a07228)", color: "#fff", fontSize: 13.5, fontWeight: 600, padding: "10px 20px", borderRadius: 9, fontFamily: sans },
 };
