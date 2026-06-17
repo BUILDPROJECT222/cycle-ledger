@@ -74,23 +74,33 @@ async function fetchKinsPrice(mint) {
   } catch { return null; }
 }
 
+const SOLANA_RPCS = [
+  "https://api.mainnet-beta.solana.com",
+  "https://rpc.ankr.com/solana",
+  "https://solana-rpc.publicnode.com",
+  "https://mainnet.helius-rpc.com/?api-key=1d8ae86e-c4c9-4c8b-af3a-9e0c0f3c9b2a",
+];
+
 async function fetchKinsBalance(walletAddr, mintAddr) {
   if (!walletAddr?.trim() || !mintAddr?.trim()) return null;
-  try {
-    const r = await fetch("https://api.mainnet-beta.solana.com", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0", id: 1,
-        method: "getTokenAccountsByOwner",
-        params: [walletAddr.trim(), { mint: mintAddr.trim() }, { encoding: "jsonParsed" }],
-      }),
-    });
-    const d = await r.json();
-    if (d.error) return null;
-    const accounts = d.result?.value || [];
-    return accounts.reduce((s, a) => s + (a.account.data.parsed.info.tokenAmount.uiAmount || 0), 0);
-  } catch { return null; }
+  for (const rpc of SOLANA_RPCS) {
+    try {
+      const r = await fetch(rpc, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: 1,
+          method: "getTokenAccountsByOwner",
+          params: [walletAddr.trim(), { mint: mintAddr.trim() }, { encoding: "jsonParsed" }],
+        }),
+      });
+      const d = await r.json();
+      if (d.error) continue;
+      const accounts = d.result?.value || [];
+      return accounts.reduce((s, a) => s + (a.account.data.parsed.info.tokenAmount.uiAmount || 0), 0);
+    } catch { continue; }
+  }
+  return null;
 }
 
 /* ============================================================
@@ -154,7 +164,7 @@ export default function ProfitTracker() {
     const bal = await fetchKinsBalance(w.address, kinsMint);
     setWallets(p => p.map(x =>
       x.id === walletId
-        ? { ...x, kinsBalance: bal, loading: false, error: bal === null ? "Gagal / alamat tidak valid" : null }
+        ? { ...x, kinsBalance: bal, loading: false, error: bal === null ? "Gagal fetch — cek alamat atau coba lagi" : null }
         : x
     ));
   };
