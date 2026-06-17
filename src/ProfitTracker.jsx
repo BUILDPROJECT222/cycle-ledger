@@ -177,7 +177,9 @@ export default function ProfitTracker() {
   };
 
   /* ---------- wallet field patch ---------- */
-  const patchWallet = (id, patch) => setWallets(p => p.map(w => w.id === id ? { ...w, ...patch } : w));
+  const patchWallet  = (id, patch) => setWallets(p => p.map(w => w.id === id ? { ...w, ...patch } : w));
+  const addWallet    = () => setWallets(p => [...p, newWallet(p.length + 1)]);
+  const removeWallet = (id) => setWallets(p => p.filter(w => w.id !== id));
 
   /* ---------- cycle derived ---------- */
   const calc = (cy) => {
@@ -383,7 +385,7 @@ export default function ProfitTracker() {
                           style={S.walletName}
                           value={w.name}
                           onChange={e => patchWallet(w.id, { name: e.target.value })}
-                          placeholder="Nama akun"
+                          placeholder="Nama"
                         />
                         <input
                           style={S.walletAddr}
@@ -400,6 +402,13 @@ export default function ProfitTracker() {
                           title="Refresh balance"
                         >
                           <RefreshCw size={13} style={w.loading ? { animation: "spin 1s linear infinite" } : {}} />
+                        </button>
+                        <button
+                          style={S.walletDelBtn}
+                          onClick={() => removeWallet(w.id)}
+                          title="Hapus wallet"
+                        >
+                          <X size={13} />
                         </button>
                       </div>
                       <div style={S.walletRowBot}>
@@ -419,6 +428,10 @@ export default function ProfitTracker() {
                   );
                 })}
               </div>
+
+              <button style={S.addWalletBtn} onClick={addWallet}>
+                <Plus size={14} /> Tambah Wallet
+              </button>
 
               {/* Total row */}
               <div style={S.walletTotal}>
@@ -688,6 +701,8 @@ const S = {
   walletName:       { width: 80, border: "none", background: "transparent", fontSize: 11, fontWeight: 700, color: PURPLE, fontFamily: mono, padding: 0 },
   walletAddr:       { flex: 1, border: "1px solid #232a34", borderRadius: 7, padding: "7px 10px", fontSize: 11.5, background: "#0f141a", color: "#c4ccd6", fontFamily: mono, minWidth: 0 },
   walletRefreshBtn: { border: "1px solid #2a3341", background: "transparent", color: "#6b7480", cursor: "pointer", display: "flex", padding: "6px 8px", borderRadius: 7 },
+  walletDelBtn:     { border: "1px solid #3a2020", background: "transparent", color: "#7a4040", cursor: "pointer", display: "flex", padding: "6px 8px", borderRadius: 7 },
+  addWalletBtn:     { display: "inline-flex", alignItems: "center", gap: 6, border: "1px dashed #3a4350", background: "transparent", color: "#8993a0", fontSize: 12.5, fontWeight: 500, padding: "8px 14px", borderRadius: 8, cursor: "pointer", fontFamily: sans, marginTop: 4 },
   walletBalLabel:   { fontSize: 9.5, color: "#5d6672", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", fontFamily: mono },
   walletBal:        { fontSize: 14, fontWeight: 700, color: "#c4b5fd", fontFamily: mono },
   walletUSD:        { fontSize: 12, color: "#8993a0", fontFamily: mono },
