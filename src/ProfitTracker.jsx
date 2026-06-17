@@ -74,6 +74,14 @@ async function fetchKinsPrice(mint) {
   } catch { return null; }
 }
 
+async function fetchSolPrice() {
+  try {
+    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+    const d = await r.json();
+    return d?.solana?.usd ?? null;
+  } catch { return null; }
+}
+
 const SOLANA_RPCS = [
   "https://mainnet.helius-rpc.com/?api-key=1db05468-e227-45cf-bd9f-cea0534b1f18",
   "https://rpc.ankr.com/solana",
@@ -142,6 +150,7 @@ export default function ProfitTracker() {
   const [kinsMint, setKinsMint]         = useState(() => load(MINT_KEY, ""));
   const [mintDraft, setMintDraft]       = useState(() => load(MINT_KEY, ""));
   const [kinsPrice, setKinsPrice]       = useState(null);
+  const [solPrice,  setSolPrice]        = useState(null);
   const [kinsPriceTs, setKinsPriceTs]   = useState(null);
   const [priceLoading, setPriceLoading] = useState(false);
   const [walletsOpen, setWalletsOpen]   = useState(true);
@@ -162,10 +171,13 @@ export default function ProfitTracker() {
   const priceIntervalRef = useRef(null);
 
   const doFetchPrice = async (mint) => {
-    if (!mint?.trim()) return;
     setPriceLoading(true);
-    const p = await fetchKinsPrice(mint);
-    if (p !== null) { setKinsPrice(p); setKinsPriceTs(Date.now()); }
+    const [kp, sp] = await Promise.all([
+      mint?.trim() ? fetchKinsPrice(mint) : Promise.resolve(null),
+      fetchSolPrice(),
+    ]);
+    if (kp !== null) { setKinsPrice(kp); setKinsPriceTs(Date.now()); }
+    if (sp !== null) setSolPrice(sp);
     setPriceLoading(false);
   };
 
@@ -296,6 +308,7 @@ export default function ProfitTracker() {
   const totalKins    = wallets.reduce((s, w) => s + (w.kinsBalance || 0), 0);
   const totalSol     = wallets.reduce((s, w) => s + (w.solBalance  || 0), 0);
   const totalKinsUSD = kinsPrice != null ? totalKins * kinsPrice : null;
+  const totalSolUSD  = solPrice  != null ? totalSol  * solPrice  : null;
   const kintaraTotalUSD = kintaraPreview.reduce((s, e) => s + Number(e.amount), 0);
 
   const priceAgo = kinsPriceTs
@@ -468,15 +481,11 @@ export default function ProfitTracker() {
               <div style={S.walletTotal}>
                 <span style={S.walletTotalLabel}>TOTAL SOL</span>
                 <span style={{ ...S.walletTotalKins, color: "#60d5fa" }}>{totalSol.toFixed(4)}</span>
+                {totalSolUSD != null && <span style={S.walletTotalUSD}>{fmtUSD(totalSolUSD)}</span>}
                 <span style={S.walletTotalSep}>·</span>
                 <span style={S.walletTotalLabel}>TOTAL KINS</span>
                 <span style={S.walletTotalKins}>{fmtKins(totalKins)}</span>
-                {totalKinsUSD != null && (
-                  <>
-                    <span style={S.walletTotalSep}>·</span>
-                    <span style={S.walletTotalUSD}>{fmtUSD(totalKinsUSD)}</span>
-                  </>
-                )}
+                {totalKinsUSD != null && <span style={S.walletTotalUSD}>{fmtUSD(totalKinsUSD)}</span>}
               </div>
             </div>
           )}
